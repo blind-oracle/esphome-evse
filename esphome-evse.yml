@@ -1,0 +1,522 @@
+external_components:
+  - source: github://blind-oracle/esphome@adc-sampling-method
+    refresh: 120s
+    components: [ adc ]
+
+substitutions:
+  friendly_name: "Car Charger"
+
+esphome:
+  name: car-charger
+  friendly_name: "${friendly_name}"
+
+  on_boot:
+  - priority: 600
+    then:
+    - lambda: |-
+        id(pwm_duty_cycle_now).publish_state(1);
+        id(fault_id).publish_state(0);
+        id(charger_state).publish_state(0);
+
+  # Try to gracefully stop the charging on reboot
+  on_shutdown:
+  - then:
+    - lambda: "id(pwm_duty_cycle_now).publish_state(1);"
+    - delay: 3s
+    - lambda: "id(relays).turn_off();"
+
+esp32:
+  board: lolin_s3_mini
+  framework:
+    type: esp-idf
+    version: latest
+
+wifi:
+  # We don't want the charger to reboot if Wi-Fi is down
+  reboot_timeout: 0s
+  networks:
+  - ssid: !secret wifi_ssid
+    password: !secret wifi_pass
+
+api:
+  # We don't want the charger to reboot if HA is unreachable
+  reboot_timeout: 0s
+ota:
+  platform: esphome
+logger:
+  level: INFO
+
+time:
+- platform: homeassistant
+  id: ha_time
+
+binary_sensor:
+- platform: status
+  name: "Connected"
+
+# Button
+- platform: gpio
+  pin:
+    number: 36
+    mode:
+      input: true
+      pulldown: true
+  id: button_charge
+  filters:
+  - delayed_on_off: 50ms
+
+  on_multi_click:
+  # Toggle charging on long press
+  - timing:
+    - "ON for at least 1s"
+    then:
+    - lambda: |-
+        id(charging_enabled).toggle();
+
+  # Cycle through currents on short press
+  - timing:
+    - "ON for at most 500ms"
+    - "OFF for at least 50ms"
+    then:
+    - lambda: |-
+        float cur = id(max_current).state;
+        cur += 1;
+        if (cur > 16) {
+          cur = 6;
+        }
+
+        id(max_current).publish_state(cur);
+
+uart:
+  rx_pin: 18
+  tx_pin: 16
+  baud_rate: 9600
+
+modbus:
+
+globals:
+- id: fault_count
+  type: int
+  restore_value: no
+
+- id: fault_count_max
+  type: int
+  restore_value: no
+  initial_value: '20'
+
+text_sensor:
+- platform: template
+  id: charger_status
+  name: "Charge Status"
+  update_interval: never
+
+- platform: template
+  id: car_status
+  name: "Car Status"
+  update_interval: never
+
+- platform: template
+  id: fault
+  name: "Fault"
+  update_interval: 10ms
+
+sensor:
+- platform: uptime
+  name: "Uptime"
+
+- platform: internal_temperature
+  id: temp_cpu
+  name: "Temperature CPU"
+
+- platform: pzemac
+  update_interval: 500ms
+
+  current:
+    id: measured_current
+    name: "Current"
+  voltage:
+    id: measured_voltage
+    name: "Voltage"
+  energy:
+    id: measured_energy
+    name: "Energy"
+  power:
+    id: measured_power
+    name: "Power"
+  frequency:
+    id: measured_frequency
+    name: "Frequency"
+  power_factor:
+    id: measured_power_factor
+    name: "Power Factor"
+
+# Energy when charging was started
+- platform: template
+  id: energy_start
+  name: "Energy start"
+  internal: true
+  update_interval: never
+
+# PWM duty cycle that's emitted when the car is connected
+- platform: template
+  id: pwm_duty_cycle_charge
+  internal: true
+  update_interval: never
+
+# Current PWM duty cycle
+- platform: template
+  id: pwm_duty_cycle_now
+  internal: true
+  update_interval: never
+
+  on_value:
+    then:
+      - lambda: |-
+          id(pilot_pwm).set_level(x);
+
+- platform: template
+  id: fault_id
+  internal: true
+  update_interval: never
+
+  on_value:
+    then:
+      - lambda: |-
+          // Turn off the charging switch if there's a fault
+          if (x != 0 && id(charging_enabled).state) {
+            id(charging_enabled).turn_off();
+          }
+
+          if (x == 0) {
+            id(fault).publish_state("NONE");
+          } else if (x == 1) {
+            id(fault).publish_state("PILOT_VOLTAGE");
+          } else if (x == 2) {
+            id(fault).publish_state("DIODE");
+          } else {
+            id(fault).publish_state("UNKNOWN");
+          }
+
+# ESP32 ADC1 sample latency is about 10us, so 200 samples should take around 2ms
+# Using the same pin for both sensors here should be safe.
+
+## Measure max voltage over the period
+- platform: adc
+  internal: true
+  pin: 
+    number: 8
+    allow_other_uses: true
+  name: pilot_voltage_max
+  id: pilot_voltage_max
+  attenuation: 12db
+  samples: 200
+  sampling_mode: max
+  update_interval: 10ms
+
+## Measure min voltage over the period
+- platform: adc
+  internal: true
+  pin: 
+    number: 8
+    allow_other_uses: true
+  name: pilot_voltage_min
+  id: pilot_voltage_min
+  attenuation: 12db
+  samples: 200
+  sampling_mode: min
+  update_interval: 10ms
+
+# Check pilot voltages periodically and map them into ranges
+- platform: template
+  internal: true
+  id: pilot_state
+  name: pilot_state
+  update_interval: 10ms
+
+  on_value:
+    then:
+      - lambda: |-
+          if (x == -1) {
+            id(car_status).publish_state("FAULT");
+          } else if (x == 0) {
+            id(car_status).publish_state("UNPLUGGED");
+          } else if (x == 1) {
+            id(car_status).publish_state("PLUGGED");
+          } else if (x == 2) {
+            id(car_status).publish_state("CHARGE");
+          } else if (x == 3) {
+            id(car_status).publish_state("CHARGE_VENT");
+          } else {
+            id(car_status).publish_state("UNKNOWN");
+          }
+
+  lambda: |-
+    static float last_value = 0;
+
+    float pwm_duty_now = id(pwm_duty_cycle_now).state;
+    float vmin = id(pilot_voltage_min).state;
+    float vmax = id(pilot_voltage_max).state;
+
+    // Minimal voltage should always be -12v, if it's higher -> then there's a diode fault.
+    // Check minimal voltage only when the PWM duty cycle is not 100%, otherwise it makes no sense.
+    if (vmin < 0.8 || pwm_duty_now == 1) {
+      if (vmax >= 2.8) {
+        // Unplugged (12v)
+        id(fault_count) = 0;
+        last_value = 0;
+        return 0;
+      } else if (vmax >= 2.4) {
+        // Plugged (9v)
+        id(fault_count) = 0;
+        last_value = 1;
+        return 1;
+      } else if (vmax >= 2.2) {
+        // Ready to charge (6v)
+        id(fault_count) = 0;
+        last_value = 2;
+        return 2;
+      } else if (vmax >= 1.8) {
+        // Ready to charge with ventilation (3v)
+        id(fault_count) = 0;
+        last_value = 3;
+        return 3;
+      } else {
+        // Voltage out of bounds, probably some hardware fault
+        if (id(fault_count) <= id(fault_count_max)) {
+          id(fault_count) += 1;
+          return last_value;
+        }
+
+        // Set the fault state
+        if (id(fault_id).state == 0) {
+          id(fault_id).publish_state(1);
+        }
+
+        return -1;
+      }
+    } else {
+      // Diode fault
+      if (id(fault_count) <= id(fault_count_max)) {
+        id(fault_count) += 1;
+        return last_value;
+      } else if (id(fault_id).state == 0) {
+        // Set the fault state
+        id(fault_id).publish_state(2);
+      }
+
+      return -1;
+    }
+
+- platform: template
+  id: charger_state
+  internal: true
+  update_interval: 10ms
+
+  on_value:
+    then:
+      - lambda: |-
+          if (x == -1) {
+            id(charger_status).publish_state("FAULT");
+          } else if (x == 0) {
+            id(charger_status).publish_state("IDLE");
+          } else if (x == 1) {
+            id(charger_status).publish_state("READY");
+          } else if (x == 2) {
+            id(charger_status).publish_state("CHARGING");
+          } else {
+            id(charger_status).publish_state("UNKNOWN");
+          }
+
+  lambda: |-
+    static int last_loop = 0;
+
+    float car_state = id(pilot_state).state;
+    float state = id(charger_state).state;
+    float pwm_duty_charge = id(pwm_duty_cycle_charge).state;
+
+    bool fault_present = id(fault_id).state > 0;
+    bool chg_enabled = id(charging_enabled).state;
+
+    // Disconnect the relays & go into the -1 state if there's a fault condition
+    if (fault_present && state != -1) {
+      id(pwm_duty_cycle_now).publish_state(1);
+      id(relays).turn_off();
+      return -1;
+    }
+
+    // Throttle down state changes a bit, car doesn't like very fast transitions
+    if (millis() - last_loop < 300) {
+      return {};
+    }
+
+    last_loop = millis();
+
+    // Main charge state machine
+    if (state == -1) {
+      // Fault state, go into 0 state if the fault was cleared
+      if (!fault_present) {
+        return 0;
+      }
+    } else if (state == 0) {
+      // IDLE
+      if (chg_enabled && car_state >= 1) {
+        // If the car is plugged and it's time to charge -> we start to advertise our max current and go to state 1
+        id(pwm_duty_cycle_now).publish_state(pwm_duty_charge);
+        return 1;
+      }
+    } else if (state == 1) {
+      // READY
+      if (car_state < 1) {
+        // Car was unplugged - set PWM to +12v and go into state 0
+        id(pwm_duty_cycle_now).publish_state(1);
+        return 0;
+      } else if (car_state >= 2) {
+        // If the car is ready to take the charge -> connect the relays and go to state 2
+        id(relays).turn_on();
+        id(energy_start).publish_state(id(measured_energy).state);
+        return 2;
+      }
+    } else if (state == 2) {
+      // CHARGING
+      if (car_state < 2) {
+        // If the car doesn't want to charge anymore - disconnect relays and go into state 0
+        id(relays).turn_off();
+        return 0;
+      }
+    }
+
+    // State hasn't changed
+    return {};
+
+switch:
+- platform: gpio
+  id: relay_l
+  internal: true
+  restore_mode: ALWAYS_OFF
+
+  pin:
+    number: 37
+    mode:
+      output: true
+      pulldown: true
+
+- platform: gpio
+  id: relay_n
+  internal: true
+  restore_mode: ALWAYS_OFF
+
+  pin:
+    number: 38
+    mode:
+      output: true
+      pulldown: true
+
+- platform: template
+  id: relays
+  turn_on_action:
+  - switch.turn_on: relay_l
+  - switch.turn_on: relay_n
+  turn_off_action:
+  - switch.turn_off: relay_l
+  - switch.turn_off: relay_n
+
+- platform: template
+  id: charging_enabled
+  name: "Charging Enabled"
+  optimistic: true
+
+  on_turn_on: 
+    then:
+      # Clear the fault if any
+      - lambda: |-
+          id(fault_id).publish_state(0);
+          id(fault_count) = 0;
+  on_turn_off: 
+    then:
+      # Disable PWM to indicate that we don't want to provide power anymore
+      - lambda: |-
+          id(pwm_duty_cycle_now).publish_state(1);
+
+output:
+- platform: ledc
+  pin: 13
+  id: pilot_pwm
+  frequency: 1000hz
+
+spi:
+  clk_pin: 4
+  mosi_pin: 5
+
+font:
+- file: "fonts/6x9.bdf"
+  id: fnt
+
+display:
+- platform: ssd1306_spi
+  model: "SH1107 128x128"
+  rotation: 180
+  cs_pin: 6
+  dc_pin: 12
+  reset_pin: 7
+  update_interval: 500ms
+  lambda: |-
+    it.rectangle(0, 0, 128, 128);
+
+    for(int i = 15; i < 110; i += 17) {
+      it.line(0, i, 128, i);
+    }
+
+    it.printf(4, 4, id(fnt), "%3.0fV   %2.1fA   %1.2fkW", id(measured_voltage).state, id(measured_current).state, id(measured_power).state / 1000);
+
+    int bar_len = (id(max_current).state - 6) * 9 + 10;
+    it.filled_rectangle(28, 15, bar_len, 18);
+    it.printf(4, 21, id(fnt), "%2.0fA", id(max_current).state);
+
+    if (id(fault_id).state == 0) {
+      it.printf(4, 38, id(fnt), "%-8s", id(charger_status).state.c_str());
+    } else {
+      it.printf(4, 38, id(fnt), "FAULT: %s", id(fault).state.c_str());
+    }
+
+    if (id(charging_enabled).state) {
+      it.printf(108, 38, id(fnt), "ON");
+    } else {
+      it.printf(108, 38, id(fnt), "OFF");
+    }
+
+    it.printf(4, 55, id(fnt), "CAR: %s", id(car_status).state.c_str());
+    it.printf(4, 72, id(fnt), "%.1f C", id(temp_cpu).state);
+    it.strftime(4, 89, id(fnt), " %a %d.%m.%y %H:%M", id(ha_time).now());
+
+    // Display the amount of energy transferred during current charging session
+    float kwh = 0;
+    if (id(charger_state).state == 2) {
+      kwh = (id(measured_energy).state - id(energy_start).state) / 1000;
+    }
+
+    it.printf(4, 110, id(fnt), "%2.0fHz   %4.1f/%.0f kWh", id(measured_frequency).state, kwh, id(measured_energy).state / 1000);
+
+number:
+- platform: template
+  icon: "mdi:current-ac"
+  unit_of_measurement: "A"
+  device_class: "current"
+  id: max_current
+  name: "Max Current"
+  optimistic: true
+  restore_value: true
+  min_value: 6
+  max_value: 16
+  step: 1
+
+  on_value:
+    then:
+    - lambda: |-
+        // No idea why we need an offset of 3
+        float duty = ((x+3) / 0.6) / 100;
+        id(pwm_duty_cycle_charge).publish_state(duty);
+
+        // Update the current duty if PWM is enabled
+        if (id(pwm_duty_cycle_now).state != 1) {
+          id(pwm_duty_cycle_now).publish_state(duty);
+        }

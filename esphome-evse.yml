@@ -66,12 +66,21 @@ binary_sensor:
   - delayed_on_off: 50ms
 
   on_multi_click:
-  # Toggle charging on long press
+  # Toggle charging forced on very long press
+  - timing:
+    - "ON for at least 2s"
+    then:
+    - lambda: |-
+        // .toggle() for some reason doesn't work correctly
+        id(charging_forced).publish_state(!id(charging_forced).state);
+
+  # Toggle charging allowed on long press
   - timing:
     - "ON for at least 1s"
     then:
     - lambda: |-
-        id(charging_enabled).toggle();
+        // .toggle() for some reason doesn't work correctly
+        id(charging_allowed).publish_state(!id(charging_allowed).state);
 
   # Cycle through currents on short press
   - timing:
@@ -102,7 +111,7 @@ globals:
 - id: fault_count_max
   type: int
   restore_value: no
-  initial_value: '20'
+  initial_value: '40'
 
 text_sensor:
 - platform: template
@@ -140,6 +149,14 @@ sensor:
   energy:
     id: measured_energy
     name: "Energy"
+
+    on_value: 
+      then:
+        - lambda: |-
+            if (isnan(id(energy_start).state)) {
+              id(energy_start).publish_state(x);
+            }
+
   power:
     id: measured_power
     name: "Power"
@@ -153,9 +170,19 @@ sensor:
 # Energy when charging was started
 - platform: template
   id: energy_start
-  name: "Energy start"
   internal: true
   update_interval: never
+
+# Energy when charging was started
+- platform: template
+  id: energy_last_charge
+  name: "Energy Last Charge"
+  unit_of_measurement: "kWh"
+  device_class: energy
+  state_class: total_increasing
+  update_interval: 1s
+
+  lambda: "return (id(measured_energy).state - id(energy_start).state) / 1000;"
 
 # PWM duty cycle that's emitted when the car is connected
 - platform: template
@@ -184,7 +211,7 @@ sensor:
       - lambda: |-
           // Turn off the charging switch if there's a fault
           if (x != 0 && id(charging_enabled).state) {
-            id(charging_enabled).turn_off();
+            id(charging_enabled).publish_state(false);
           }
 
           if (x == 0) {
@@ -259,13 +286,13 @@ sensor:
 
     // Minimal voltage should always be -12v, if it's higher -> then there's a diode fault.
     // Check minimal voltage only when the PWM duty cycle is not 100%, otherwise it makes no sense.
-    if (vmin < 0.8 || pwm_duty_now == 1) {
-      if (vmax >= 2.8) {
+    if (vmin < 0.4 || pwm_duty_now == 1) {
+      if (vmax >= 2.9) {
         // Unplugged (12v)
         id(fault_count) = 0;
         last_value = 0;
         return 0;
-      } else if (vmax >= 2.4) {
+      } else if (vmax >= 2.5) {
         // Plugged (9v)
         id(fault_count) = 0;
         last_value = 1;
@@ -330,6 +357,7 @@ sensor:
   lambda: |-
     static int last_loop = 0;
 
+    int now = millis();
     float car_state = id(pilot_state).state;
     float state = id(charger_state).state;
     float pwm_duty_charge = id(pwm_duty_cycle_charge).state;
@@ -344,12 +372,11 @@ sensor:
       return -1;
     }
 
-    // Throttle down state changes a bit, car doesn't like very fast transitions
-    if (millis() - last_loop < 300) {
+    // Throttle state changes a bit, the car doesn't like very fast transitions
+    if (now - last_loop < 200) {
       return {};
     }
-
-    last_loop = millis();
+    last_loop = now;
 
     // Main charge state machine
     if (state == -1) {
@@ -422,10 +449,10 @@ switch:
 
 - platform: template
   id: charging_enabled
-  name: "Charging Enabled"
+  internal: true
   optimistic: true
 
-  on_turn_on: 
+  on_turn_on:
     then:
       # Clear the fault if any
       - lambda: |-
@@ -436,6 +463,41 @@ switch:
       # Disable PWM to indicate that we don't want to provide power anymore
       - lambda: |-
           id(pwm_duty_cycle_now).publish_state(1);
+
+- platform: template
+  id: charging_forced
+  name: "Charging Forced"
+  optimistic: true
+
+  on_turn_on:
+    then:
+      - lambda: |-
+          id(charging_enabled).publish_state(true);
+
+  on_turn_off: 
+    then:
+      - lambda: |-
+          // If the charging isn't allowed - disable it
+          if (!id(charging_allowed).state) {
+            id(charging_enabled).publish_state(false);
+          }
+
+- platform: template
+  id: charging_allowed
+  name: "Charging Allowed"
+  optimistic: true
+
+  on_turn_on:
+    then:
+      - lambda: |-
+          id(charging_enabled).publish_state(true);
+  on_turn_off: 
+    then:
+      - lambda: |-
+          // If the charging isn't forced - disable it
+          if (!id(charging_forced).state) {
+            id(charging_enabled).publish_state(false);
+          }
 
 output:
 - platform: ledc
@@ -478,23 +540,19 @@ display:
       it.printf(4, 38, id(fnt), "FAULT: %s", id(fault).state.c_str());
     }
 
-    if (id(charging_enabled).state) {
-      it.printf(108, 38, id(fnt), "ON");
+    if (id(charging_forced).state) {
+      it.printf(86, 38, id(fnt), "FORCED");
+    } else if (id(charging_enabled).state) {
+      it.printf(86, 38, id(fnt), "    ON");
     } else {
-      it.printf(108, 38, id(fnt), "OFF");
+      it.printf(86, 38, id(fnt), "   OFF");
     }
 
     it.printf(4, 55, id(fnt), "CAR: %s", id(car_status).state.c_str());
     it.printf(4, 72, id(fnt), "%.1f C", id(temp_cpu).state);
     it.strftime(4, 89, id(fnt), " %a %d.%m.%y %H:%M", id(ha_time).now());
 
-    // Display the amount of energy transferred during current charging session
-    float kwh = 0;
-    if (id(charger_state).state == 2) {
-      kwh = (id(measured_energy).state - id(energy_start).state) / 1000;
-    }
-
-    it.printf(4, 110, id(fnt), "%2.0fHz   %4.1f/%.0f kWh", id(measured_frequency).state, kwh, id(measured_energy).state / 1000);
+    it.printf(4, 110, id(fnt), "%2.0fHz   %4.1f/%.0f kWh", id(measured_frequency).state, id(energy_last_charge).state, id(measured_energy).state / 1000);
 
 number:
 - platform: template
